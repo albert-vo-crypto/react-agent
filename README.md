@@ -90,3 +90,13 @@ You can find the latest (under construction) docs on [LangGraph](https://github.
 LangGraph Studio also integrates with [LangSmith](https://smith.langchain.com/) for more in-depth tracing and collaboration with teammates.
 
 [^1]: https://python.langchain.com/docs/concepts/#tools
+
+## SPIFFE / SPIRE Workload Identity & NHI
+
+This repository includes built-in SPIFFE/SPIRE workload attestation for autonomous agents (Non-Human Identity / NHI):
+
+- **SPIRE Server & Agent Configuration**: Located in `spire/conf/server/` and `spire/conf/agent/`.
+- **Identity Provider Module**: `src/react_agent/spire_identity.py` interacts with the Workload API Unix Domain Socket to retrieve short-lived X.509 and JWT SVIDs.
+- **Automated Setup Script**: `spire/scripts/setup_spire.sh` bootstraps the server, node attestation join token, agent, and workload entry.
+- **Secure Launcher**: `start_secure_agent.sh` checks SPIRE health, attests the workload via kernel selectors (`unix:uid`), and outputs the attested SPIFFE ID (`spiffe://example.org/workload/react-agent`).
+- **Tests**: `tests/unit_tests/test_spire_identity.py` verifies socket availability and valid X.509-SVID issuance.
