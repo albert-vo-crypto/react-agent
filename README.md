@@ -97,6 +97,87 @@ This repository includes built-in SPIFFE/SPIRE workload attestation for autonomo
 
 - **SPIRE Server & Agent Configuration**: Located in `spire/conf/server/` and `spire/conf/agent/`.
 - **Identity Provider Module**: `src/react_agent/spire_identity.py` interacts with the Workload API Unix Domain Socket to retrieve short-lived X.509 and JWT SVIDs.
+- **Client Helper**: `spire_client.py` connects to `/tmp/spire-agent/public/api.sock` and extracts the X.509-SVID client certificate (`URI:spiffe://example.org/workload/react-agent`) and private key.
 - **Automated Setup Script**: `spire/scripts/setup_spire.sh` bootstraps the server, node attestation join token, agent, and workload entry.
 - **Secure Launcher**: `start_secure_agent.sh` checks SPIRE health, attests the workload via kernel selectors (`unix:uid`), and outputs the attested SPIFFE ID (`spiffe://example.org/workload/react-agent`).
 - **Tests**: `tests/unit_tests/test_spire_identity.py` verifies socket availability and valid X.509-SVID issuance.
+
+---
+
+## Keycloak 26 RFC 8693 Token Exchange & Downstream MCP Delegation
+
+The agent supports the **OAuth 2.0 Token Exchange (RFC 8693)** protocol using **Keycloak 26** as the Security Token Service (STS) to implement On-Behalf-Of (OBO) user delegation with downstream MCP servers:
+
+```
+[User Token] ──> [React Agent (SPIRE Attested)] ──(RFC 8693 Exchange)──> [Keycloak 26 STS]
+                                                                                │
+                                                                   [Exchanged Token with 'act' claim]
+                                                                                │
+                                                                                ▼
+                                                                     [Downstream MCP Server]
+```
+
+### 1. Keycloak Architecture & Configuration
+- **STS Endpoint**: `POST http://localhost:8082/realms/myrealm/protocol/openid-connect/token` (or configured port)
+- **Token Exchange Standard**: Keycloak 26 Quarkus distribution started with `--features=token-exchange-standard:v2`.
+- **Realm & Clients**:
+  - `myrealm`: Realm hosting users and client apps.
+  - `user-client`: Public client issuing user access tokens (`alice`). Configured with an `oidc-audience-mapper` adding `react-agent` to token audience (`aud`).
+  - `react-agent`: Confidential client (`client_secret: agent-secret`) authorized to perform standard token exchange. Includes an `oidc-audience-mapper` targeting `api://my-mcp-server` and `act` actor delegation mappers.
+  - `api://my-mcp-server`: Resource server client representing downstream tools and MCP capabilities.
+
+### 2. Quick Setup & Launch
+
+#### Start Keycloak 26 Container
+```bash
+docker run -d --name keycloak -p 8082:8080 \
+  -e KEYCLOAK_ADMIN=admin \
+  -e KEYCLOAK_ADMIN_PASSWORD=admin \
+  quay.io/keycloak/keycloak:26.4.5 \
+  start-dev --features=token-exchange-standard:v2
+```
+
+#### Run SPIRE Daemons
+```bash
+# Start SPIRE Server & Agent (exposing Workload API at /tmp/spire-agent/public/api.sock)
+./spire/scripts/setup_spire.sh
+```
+
+### 3. Agent Token Exchange Client
+
+`keycloak_exchange.py` performs the RFC 8693 grant:
+```python
+from keycloak_exchange import exchange_token, get_user_token
+
+# 1. Acquire user access token
+user_token = get_user_token("alice", "password123")
+
+# 2. Exchange user token on behalf of react-agent for target audience
+mcp_token = exchange_token(
+    subject_token=user_token,
+    audience="api://my-mcp-server",
+    scope="mcp.tools.execute"
+)
+```
+
+The resulting JWT includes:
+- `aud`: `api://my-mcp-server`
+- `sub`: User's ID / subject
+- `act`: `{"sub": "react-agent"}` (delegation trail proving the agent called on user's behalf)
+
+### 4. Running Automated Tests
+
+Run the end-to-end test suite (`tests/test_keycloak_spire_e2e.py`) which validates SPIRE attestation, Keycloak token exchange, downstream MCP tool execution, and negative security controls:
+
+```bash
+PYTHONPATH=. pytest -v tests/test_keycloak_spire_e2e.py
+```
+
+Test suite coverage:
+1. `test_01_spire_workload_attestation`: Verifies live SVID certificate retrieval from SPIRE Workload API matching SPIFFE ID `spiffe://example.org/workload/react-agent`.
+2. `test_02_user_login`: Validates user authentication against Keycloak.
+3. `test_03_token_exchange`: Tests RFC 8693 exchange for user token to `api://my-mcp-server`.
+4. `test_04_downstream_mcp_call`: Validates authorized MCP tool call (`tools/call`) with delegation actor claims.
+5. `test_05_security_regression_invalid_client`: Asserts exchange fails with invalid agent credentials.
+6. `test_06_security_regression_audience_mismatch`: Asserts MCP server rejects mismatched token audience.
+7. `test_07_security_regression_tampered_token`: Asserts MCP server rejects invalid signatures or tampered bearer tokens.
