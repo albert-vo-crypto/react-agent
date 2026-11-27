@@ -308,3 +308,109 @@ Test suite coverage:
 5. `test_05_security_regression_audience_mismatch`: Asserts Agentgateway rejects tokens issued for mismatched audiences.
 6. `test_06_security_regression_scope_escalation`: Asserts unauthorized scope escalation requests are rejected or bounded.
 7. `test_07_security_regression_session_expiration_coupling`: Asserts logging out the user from Keycloak invalidates subsequent delegation and exchange requests (`invalid_request` / `invalid_grant`).
+
+---
+
+## SurrealDB Hardened RLS Integration & RFC 8693 Delegation Flow
+
+The architecture supports row-level security (RLS) on **SurrealDB** (with embedded `SurrealKV` storage) using RFC 8693 delegated access tokens through **Agentgateway**:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Alice as Human User (alice)
+    participant Agent as React Agent (SPIRE Attested)
+    participant Spire as SPIRE Agent (/tmp/spire-agent/public/api.sock)
+    participant Gateway as Agentgateway (Port 8088 /mcp)
+    participant Keycloak as Keycloak 26 STS (Port 8082)
+    participant SurrealDB as SurrealDB (Port 8000)
+
+    Note over Agent,Spire: 1. Zero-Trust Kernel Attestation
+    Agent->>Spire: Fetch Workload SVID (unix:uid:1000)
+    Spire-->>Agent: X.509-SVID (spiffe://example.org/workload/react-agent)
+
+    Note over Alice,Keycloak: 2. End-User Interactive Login
+    Alice->>Keycloak: POST /protocol/openid-connect/token (react-agent-client)
+    Keycloak-->>Agent: Subject Token (aud: ["agentgateway", "account"], azp: react-agent-client)
+
+    Note over Agent,Gateway: 3. MCP Tool Invocation over Modern Streamable-HTTP
+    Agent->>Gateway: POST /mcp (tool: surrealdb_surrealdb_query)<br/>Authorization: Bearer <Subject_Token>
+
+    Note over Gateway,Keycloak: 4. RFC 8693 Token Exchange (Delegation)
+    Gateway->>Keycloak: POST /protocol/openid-connect/token<br/>grant_type=token-exchange, audience=api://surrealdb, client=agentgateway
+    Keycloak-->>Gateway: Downstream Token (aud: api://surrealdb, act: {sub: react-agent}, ns: main, db: main)
+
+    Note over Gateway,SurrealDB: 5. Downstream Authenticated Execution
+    Gateway->>SurrealDB: POST /sql (Authorization: Bearer <Downstream_Token>)
+    SurrealDB->>SurrealDB: Validate Keycloak JWKS & RLS ($auth == user.sub, $token.actor_sub == react-agent)
+    SurrealDB-->>Gateway: Query Result
+    Gateway-->>Agent: MCP JSON-RPC Response (isError: false)
+```
+
+### JWT Comparison: BEFORE vs. AFTER RFC 8693 Token Exchange
+
+#### 1. Inbound User Subject Token (BEFORE Exchange)
+Issued to `react-agent-client` on behalf of user `alice`. Injected audience contains `agentgateway`:
+```json
+{
+  "iss": "http://localhost:8082/realms/myrealm",
+  "sub": "08d72b02-60d9-4979-894b-e430d3fb2b44",
+  "aud": [
+    "agentgateway",
+    "account"
+  ],
+  "azp": "react-agent-client",
+  "scope": "email profile",
+  "email": "alice@example.com"
+}
+```
+
+#### 2. Downstream Database Token (AFTER Exchange)
+Minted by Keycloak 26 via standard RFC 8693 token exchange. The audience is confined to `api://surrealdb`, injecting SurrealDB routing claims (`ns`, `db`, `ac`) and delegation audit trail (`act`):
+```json
+{
+  "iss": "http://localhost:8082/realms/myrealm",
+  "sub": "08d72b02-60d9-4979-894b-e430d3fb2b44",
+  "aud": "api://surrealdb",
+  "azp": "agentgateway",
+  "scope": "email profile surrealdb:query",
+  "act": {
+    "sub": "react-agent"
+  },
+  "actor_sub": "react-agent",
+  "ns": "main",
+  "db": "main",
+  "ac": "keycloak_jwt",
+  "email": "alice@example.com"
+}
+```
+
+### Running SurrealDB End-to-End Tests
+
+Execute the SurrealDB integration and security test suite (`tests/test_keycloak_spire_surrealdb_e2e.py`):
+
+```bash
+PYTHONPATH=. pytest -v tests/test_keycloak_spire_surrealdb_e2e.py
+```
+
+### Complete Verification Test Run Output
+
+```text
+================================================ pytest test session ================================================
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_01_spire_workload_attestation PASSED [  7%]
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_02_unauthorized_svid_fetch PASSED     [ 14%]
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_03_positive_token_exchange_and_mcp_tool_execution PASSED [ 21%]
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_04_delegation_audit_trail_validation PASSED [ 28%]
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_05_security_regression_audience_mismatch PASSED [ 35%]
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_06_security_regression_scope_escalation PASSED [ 42%]
+tests/test_keycloak_spire_agentgateway_e2e.py::TestKeycloakSpireAgentgatewayE2E::test_07_security_regression_session_expiration_coupling PASSED [ 50%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_01_spire_workload_attestation PASSED     [ 57%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_02_unauthorized_svid_fetch PASSED         [ 64%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_03_keycloak_rfc8693_token_exchange PASSED [ 71%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_04_downstream_mcp_surrealdb_execution PASSED [ 78%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_05_security_regression_audience_mismatch PASSED [ 85%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_06_security_regression_actor_delegation_enforcement PASSED [ 92%]
+tests/test_keycloak_spire_surrealdb_e2e.py::TestKeycloakSpireSurrealDBE2E::test_07_security_regression_session_logout_coupling PASSED [100%]
+
+================================================ 14 passed in 4.98s ================================================
+```
