@@ -313,7 +313,7 @@ Test suite coverage:
 
 ## SurrealDB Hardened RLS Integration & RFC 8693 Delegation Flow
 
-The architecture supports row-level security (RLS) on **SurrealDB** (with embedded `SurrealKV` storage) using RFC 8693 delegated access tokens through **Agentgateway**:
+The architecture supports row-level security (RLS) on **SurrealDB** (with embedded `SurrealKV` storage) via a dedicated **SurrealDB MCP Server** using RFC 8693 delegated access tokens through **Agentgateway**:
 
 ```mermaid
 sequenceDiagram
@@ -322,6 +322,7 @@ sequenceDiagram
     participant Agent as React Agent (SPIRE Attested)
     participant Spire as SPIRE Agent (/tmp/spire-agent/public/api.sock)
     participant Gateway as Agentgateway (Port 8088 /mcp)
+    participant SurrealMCP as SurrealDB MCP Server (surrealdb_mcp_server.py)
     participant Keycloak as Keycloak 26 STS (Port 8082)
     participant SurrealDB as SurrealDB (Port 8000)
 
@@ -336,16 +337,42 @@ sequenceDiagram
     Note over Agent,Gateway: 3. MCP Tool Invocation over Modern Streamable-HTTP
     Agent->>Gateway: POST /mcp (tool: surrealdb_surrealdb_query)<br/>Authorization: Bearer <Subject_Token>
 
-    Note over Gateway,Keycloak: 4. RFC 8693 Token Exchange (Delegation)
-    Gateway->>Keycloak: POST /protocol/openid-connect/token<br/>grant_type=token-exchange, audience=api://surrealdb, client=agentgateway
-    Keycloak-->>Gateway: Downstream Token (aud: api://surrealdb, act: {sub: react-agent}, ns: main, db: main)
+    Note over Gateway,SurrealMCP: 4. Gateway Tool Delegation
+    Gateway->>SurrealMCP: JSON-RPC tools/call (surrealdb_query)<br/>passes inbound Subject_Token
 
-    Note over Gateway,SurrealDB: 5. Downstream Authenticated Execution
-    Gateway->>SurrealDB: POST /sql (Authorization: Bearer <Downstream_Token>)
+    Note over SurrealMCP,Keycloak: 5. RFC 8693 Token Exchange (Delegation)
+    SurrealMCP->>Keycloak: POST /protocol/openid-connect/token<br/>grant_type=token-exchange, audience=api://surrealdb, client=agentgateway
+    Keycloak-->>SurrealMCP: Downstream Token (aud: api://surrealdb, act: {sub: react-agent}, ns: main, db: main)
+
+    Note over SurrealMCP,SurrealDB: 6. Authenticated Database Execution
+    SurrealMCP->>SurrealDB: POST /sql (Authorization: Bearer <Downstream_Token>)
     SurrealDB->>SurrealDB: Validate Keycloak JWKS & RLS ($auth == user.sub, $token.actor_sub == react-agent)
-    SurrealDB-->>Gateway: Query Result
+    SurrealDB-->>SurrealMCP: Query Result
+    SurrealMCP-->>Gateway: MCP Tool Result
     Gateway-->>Agent: MCP JSON-RPC Response (isError: false)
 ```
+
+### SurrealDB MCP Server Architecture
+
+1. **MCP Server Daemon (`surrealdb_mcp_server.py`)**:
+   - Built on the Model Context Protocol (MCP) server framework exposing the `surrealdb_query` tool.
+   - Accepts the user's inbound token and automatically executes an RFC 8693 Token Exchange against Keycloak.
+   - Executes the SurrealQL query against SurrealDB's REST endpoint (`/sql`) using the scoped downstream Bearer token.
+2. **Registration in Agentgateway (`agentgateway.yaml`)**:
+   - Registered as a managed stdio target under `surrealdb`:
+     ```yaml
+     targets:
+     - name: surrealdb
+       stdio:
+         cmd: /home/dev1/.venv/bin/python
+         args: ["/home/dev1/surrealdb_mcp_server.py"]
+         env:
+           KEYCLOAK_GATEWAY_CLIENT_SECRET: "${KEYCLOAK_GATEWAY_CLIENT_SECRET}"
+           KEYCLOAK_URL: "http://localhost:8082"
+           KEYCLOAK_REALM: "myrealm"
+           SURREALDB_URL: "http://127.0.0.1:8000"
+     ```
+   - Exposed to clients as `surrealdb_surrealdb_query` over modern streamable-HTTP MCP.
 
 ### JWT Comparison: BEFORE vs. AFTER RFC 8693 Token Exchange
 
