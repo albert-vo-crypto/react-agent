@@ -162,3 +162,8 @@ cython_debug/
 #.idea/
 
 .langgraph_api
+.env
+*.key
+*.pem
+*.secret
+surrealdb/data/

@@ -89,7 +89,7 @@ class TestKeycloakSpireAgentgatewayE2E:
 
         # Execute MCP tool via Agentgateway
         mcp_res = call_mcp_tool(
-            tool_name="system-task/execute_system_task",
+            tool_name="system_execute_system_task",
             arguments={"task_name": "agent_audit_e2e"},
             bearer_token=exchanged_token,
             gateway_url=AGENTGATEWAY_URL,
@@ -148,7 +148,7 @@ class TestKeycloakSpireAgentgatewayE2E:
 
         # Attempt to call Agentgateway with wrong audience token
         mcp_res = call_mcp_tool(
-            tool_name="system-task/execute_system_task",
+            tool_name="system_execute_system_task",
             arguments={"task_name": "attack_audience_mismatch"},
             bearer_token=mismatched_token,
             gateway_url=AGENTGATEWAY_URL,
