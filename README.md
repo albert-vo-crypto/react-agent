@@ -181,3 +181,130 @@ Test suite coverage:
 5. `test_05_security_regression_invalid_client`: Asserts exchange fails with invalid agent credentials.
 6. `test_06_security_regression_audience_mismatch`: Asserts MCP server rejects mismatched token audience.
 7. `test_07_security_regression_tampered_token`: Asserts MCP server rejects invalid signatures or tampered bearer tokens.
+
+---
+
+## Agentgateway Enterprise MCP Server Integration
+
+The agent integrates with **[Agentgateway](https://github.com/albert-vo-crypto/agentgateway)** running as an enterprise Model Context Protocol (MCP) server and gateway. Agentgateway validates Bearer JWTs against Keycloak's JWKS endpoint, validates audience `api://agentgateway`, and enforces CEL delegation authorization policies based on the actor (`act`) claim:
+
+```
+                                               +-----------------------------+
+                                               | Keycloak 26 (Port 8082)     |
+                                               | - JWKS / Token Exchange     |
+                                               +--------------+--------------+
+                                                              ^
+                                                              | RFC 8693 Exchange
++------------------------------+     Bearer JWT               |
+| React Agent (SPIRE Attested) | ──────────────────> +--------+-----------------------+
+| - Workload SVID Client       |  (aud: agentgateway | Agentgateway MCP (Port 8088)   |
+| - agentgateway_client.py     |   act: react-agent) | - Validates Keycloak JWKS      |
++------------------------------+                     | - CEL Policy Enforcement       |
+                                                     | - Tools: system-task/*         |
+                                                     +--------------------------------+
+```
+
+### 1. Installation & Scaffolding
+
+Install the `agentgateway` binary (v1.7.0+) using its installer script:
+```bash
+git clone https://github.com/albert-vo-crypto/agentgateway.git
+AGENTGATEWAY_INSTALL_DIR="$HOME/.local/bin" bash agentgateway/tools/get-agentgateway --no-sudo
+```
+
+### 2. Configuration (`agentgateway.yaml`)
+
+Configure Agentgateway to act as an MCP server with Keycloak JWT authentication and actor-level authorization rules:
+
+```yaml
+# agentgateway.yaml
+mcp:
+  port: 8088
+  policies:
+    cors:
+      allowOrigins:
+      - "*"
+      allowHeaders:
+      - "*"
+      exposeHeaders:
+      - "Mcp-Session-Id"
+    backendAuth:
+      passthrough: {}
+    jwtAuth:
+      issuer: http://localhost:8082/realms/myrealm
+      audiences:
+      - api://agentgateway
+      jwks:
+        url: http://localhost:8082/realms/myrealm/protocol/openid-connect/certs
+    mcpAuthorization:
+      rules:
+      # CEL Rule: Ensure the token was delegated to react-agent via RFC 8693
+      - 'jwt.act.sub == "react-agent"'
+  targets:
+  - name: system-task
+    stdio:
+      cmd: python3
+      args: ["system_task_server.py"]
+```
+
+### 3. Launching Agentgateway
+
+Start Agentgateway using the configuration:
+```bash
+# Validate configuration first
+agentgateway -f agentgateway.yaml --validate-only
+
+# Run daemon
+CONFIG_CONTENT=$(cat agentgateway.yaml)
+agentgateway -c "$CONFIG_CONTENT" &
+```
+
+Or run all infrastructure daemons via the unified startup script:
+```bash
+./scripts/start_all.sh
+```
+
+### 4. Agent Tool Invocation (`agentgateway_client.py`)
+
+`agentgateway_client.py` uses the modern MCP streamable-HTTP protocol (`mcp-protocol-version: 2026-07-28`) to dispatch authenticated tool calls to Agentgateway:
+
+```python
+from keycloak_exchange import exchange_user_token
+from agentgateway_client import call_mcp_tool
+
+# 1. Exchange human user's token for Agentgateway target audience
+exchange_result = exchange_user_token(
+    subject_token=user_token,
+    audience="api://agentgateway",
+    scope="mcp.tools.execute"
+)
+exchanged_token = exchange_result["response"]["access_token"]
+
+# 2. Invoke MCP tool through Agentgateway
+result = call_mcp_tool(
+    tool_name="system-task/execute_system_task",
+    arguments={"task_name": "backup_database"},
+    bearer_token=exchanged_token,
+    gateway_url="http://localhost:8088/mcp"
+)
+
+print(result["data"])
+# {"jsonrpc": "2.0", "result": {"isError": false, "content": [{"type": "text", "text": "Task 'backup_database' executed successfully"}]}}
+```
+
+### 5. Running Automated Verification Tests
+
+Execute the comprehensive test suite (`tests/test_keycloak_spire_agentgateway_e2e.py`):
+
+```bash
+PYTHONPATH=. pytest -v tests/test_keycloak_spire_agentgateway_e2e.py
+```
+
+Test suite coverage:
+1. `test_01_spire_workload_attestation`: Validates SPIFFE SVID issuance (`spiffe://example.org/workload/react-agent`).
+2. `test_02_unauthorized_svid_fetch`: Validates unauthorized workloads are denied SVIDs.
+3. `test_03_positive_token_exchange_and_mcp_tool_execution`: Validates user authentication, RFC 8693 token exchange via Keycloak, and successful tool execution (`isError: false`) on Agentgateway.
+4. `test_04_delegation_audit_trail_validation`: Validates exchanged JWT contains `sub == user.id`, `act.sub == "react-agent"`, and `aud == "api://agentgateway"`.
+5. `test_05_security_regression_audience_mismatch`: Asserts Agentgateway rejects tokens issued for mismatched audiences.
+6. `test_06_security_regression_scope_escalation`: Asserts unauthorized scope escalation requests are rejected or bounded.
+7. `test_07_security_regression_session_expiration_coupling`: Asserts logging out the user from Keycloak invalidates subsequent delegation and exchange requests (`invalid_request` / `invalid_grant`).
