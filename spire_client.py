@@ -16,13 +16,13 @@ def check_spire_socket() -> bool:
     return os.path.exists(SPIRE_SOCKET_PATH)
 
 
-def fetch_agent_svid(output_dir: str = "/tmp") -> Dict[str, Any]:
+def fetch_agent_svid(output_dir: str = "/tmp", socket_path: str = SPIRE_SOCKET_PATH) -> Dict[str, Any]:
     """
     Connect to /tmp/spire-agent/public/api.sock and retrieve the agent's
     X.509-SVID client certificate (URI:spiffe://example.org/workload/react-agent) and key.
     """
-    if not check_spire_socket():
-        raise RuntimeError(f"SPIRE Workload API socket not found at {SPIRE_SOCKET_PATH}")
+    if not os.path.exists(socket_path):
+        raise RuntimeError(f"SPIRE Workload API socket not found at {socket_path}")
 
     fetch_cmd = [
         os.path.join(SPIRE_BIN, "spire-agent"),
@@ -30,7 +30,7 @@ def fetch_agent_svid(output_dir: str = "/tmp") -> Dict[str, Any]:
         "fetch",
         "x509",
         "-socketPath",
-        SPIRE_SOCKET_PATH,
+        socket_path,
         "-write",
         output_dir,
     ]
@@ -53,11 +53,18 @@ def fetch_agent_svid(output_dir: str = "/tmp") -> Dict[str, Any]:
             spiffe_id = line.strip().replace("URI:", "")
             break
 
+    with open(cert_path, "r") as f:
+        cert_pem = f.read()
+    with open(key_path, "r") as f:
+        key_pem = f.read()
+
     return {
         "spiffe_id": spiffe_id,
         "cert_path": cert_path,
         "key_path": key_path,
         "bundle_path": bundle_path,
+        "cert_pem": cert_pem,
+        "key_pem": key_pem,
     }
 
 

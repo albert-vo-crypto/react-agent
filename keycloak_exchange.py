@@ -14,7 +14,7 @@ CLIENT_SECRET = os.environ.get("KEYCLOAK_CLIENT_SECRET", "agent-secret")
 
 def exchange_user_token(
     subject_token: str,
-    audience: str = "api://my-mcp-server",
+    audience: str = "api://agentgateway",
     scope: str = "mcp.tools.execute",
     client_id: str = CLIENT_ID,
     client_secret: str = CLIENT_SECRET,
