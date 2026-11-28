@@ -374,6 +374,120 @@ sequenceDiagram
      ```
    - Exposed to clients as `surrealdb_surrealdb_query` over modern streamable-HTTP MCP.
 
+---
+
+### Step-by-Step Guide: OIDC Federation Between Keycloak 26 and SurrealDB
+
+This section explains step-by-step how to establish zero-trust OIDC federation between **Keycloak 26** and **SurrealDB** using SurrealDB's `DEFINE ACCESS ... TYPE RECORD WITH JWT` mechanism.
+
+#### Step 1: Network Capability Allowlisting on SurrealDB
+SurrealDB requires permission to fetch Keycloak's cryptographic keys via HTTP. When starting SurrealDB, allow outbound connections to Keycloak's port (e.g., `8082`):
+
+```bash
+surreal start \
+    --bind 127.0.0.1:8000 \
+    --username root \
+    --password "$SURREAL_ROOT_PASSWORD" \
+    --allow-net 127.0.0.1:8082,localhost:8082 \
+    surrealkv:///var/lib/surrealdb/data &
+```
+
+#### Step 2: Keycloak Client & Scope Provisioning
+Using the Keycloak Admin API or `kcadm.sh`, configure the resource server client and the query scope:
+
+1. **Create Resource Server Client (`api://surrealdb`)**:
+   - Client ID: `api://surrealdb`
+   - Access Type: Confidential / Service Account enabled (or Bearer-only)
+   - Standard Flow: Disabled
+2. **Create Client Scope (`surrealdb:query`)**:
+   - Name: `surrealdb:query`
+   - Include in Token Scope: `true`
+   - Attach as an optional/default client scope to the calling client (`agentgateway`).
+
+#### Step 3: Configure Token Routing Protocol Mappers in Keycloak
+SurrealDB requires contextual claims in the JWT to map the token to the correct Namespace, Database, and Access definition. Attach the following protocol mappers to the client performing token exchange (`agentgateway`):
+
+| Mapper Name | Protocol Mapper Type | Claim Name | Claim Value | Target Token |
+| :--- | :--- | :--- | :--- | :--- |
+| `surreal-ns-mapper` | `oidc-hardcoded-claim-mapper` | `ns` | `main` | Access Token |
+| `surreal-db-mapper` | `oidc-hardcoded-claim-mapper` | `db` | `main` | Access Token |
+| `surreal-ac-mapper` | `oidc-hardcoded-claim-mapper` | `ac` | `keycloak_jwt` | Access Token |
+| `actor-sub-mapper` | `oidc-hardcoded-claim-mapper` | `act.sub` | `react-agent` | Access Token |
+| `actor-flat-mapper`| `oidc-hardcoded-claim-mapper` | `actor_sub` | `react-agent` | Access Token |
+| `audience-surrealdb`| `oidc-audience-mapper` | `aud` | `api://surrealdb` | Access Token |
+
+#### Step 4: Define SurrealDB Schema & JWT Record Access Method
+Execute SurrealQL statements to define the schema and federated authentication rules:
+
+```sql
+-- 1. Switch to the target Namespace and Database
+DEFINE NAMESPACE IF NOT EXISTS main;
+DEFINE DATABASE IF NOT EXISTS main;
+USE NS main DB main;
+
+-- 2. Define the User Table with Row-Level Security (RLS)
+DEFINE TABLE OVERWRITE user SCHEMAFULL
+    PERMISSIONS
+        FOR select WHERE id = $auth OR $token.roles CONTAINS "admin"
+        FOR update, delete WHERE id = $auth
+        FOR create NONE; -- Users are only created via authenticated token claims
+
+DEFINE FIELD OVERWRITE email ON TABLE user TYPE string;
+DEFINE FIELD OVERWRITE original_actor ON TABLE user TYPE string;
+
+-- 3. Define Federated OIDC Access Method (Matches 'ac' claim in token)
+DEFINE ACCESS OVERWRITE keycloak_jwt ON DATABASE TYPE RECORD
+    WITH JWT 
+        URL "http://127.0.0.1:8082/realms/myrealm/protocol/openid-connect/certs"
+        AUDIENCE "api://surrealdb"
+    AUTHENTICATE {
+        IF (
+            $token.iss = "http://localhost:8082/realms/myrealm"
+            AND $token.aud CONTAINS "api://surrealdb"
+            AND $token.email_verified = true
+        ) {
+            -- Resolve or auto-provision the user record corresponding to the token subject
+            LET $record_id = type::record("user", $token.sub);
+            
+            IF !record::exists($record_id) {
+                CREATE $record_id SET 
+                    email = $token.email,
+                    original_actor = $token.actor_sub;
+            };
+            
+            RETURN $record_id;
+        } ELSE {
+            THROW "Unauthorized: Issuer, audience mismatch, or unverified token";
+        }
+    }
+    DURATION FOR SESSION 1h;
+
+-- 4. Define Agent Memory Table (Restricted to Authorized SPIRE Workloads)
+DEFINE TABLE OVERWRITE agent_memory SCHEMAFULL
+    PERMISSIONS
+        FOR select, create, update WHERE $auth != NONE AND $token.actor_sub = "react-agent";
+
+DEFINE FIELD OVERWRITE user_ref ON TABLE agent_memory TYPE record<user> VALUE $auth;
+DEFINE FIELD OVERWRITE prompt_log ON TABLE agent_memory TYPE string;
+DEFINE FIELD OVERWRITE response_data ON TABLE agent_memory TYPE string;
+```
+
+#### Step 5: Verification of Federated Authentication
+Send an HTTP request directly to SurrealDB using the exchanged token:
+
+```bash
+curl -X POST http://127.0.0.1:8000/sql \
+  -H "Authorization: Bearer <EXCHANGED_SURREALDB_JWT>" \
+  -H "Accept: application/json" \
+  -H "NS: main" \
+  -H "DB: main" \
+  -d "SELECT * FROM user;"
+```
+
+SurrealDB dynamically verifies the token against Keycloak's JWKS endpoint (`/protocol/openid-connect/certs`), validates that `aud` matches `api://surrealdb`, binds the user record to `$auth`, and executes the query with row-level security.
+
+---
+
 ### JWT Comparison: BEFORE vs. AFTER RFC 8693 Token Exchange
 
 #### 1. Inbound User Subject Token (BEFORE Exchange)
